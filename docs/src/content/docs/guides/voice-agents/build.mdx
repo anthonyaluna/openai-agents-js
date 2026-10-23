@@ -158,6 +158,12 @@ By listening to this event you can show a UI to the user to approve or reject th
 
 <Code lang="typescript" code={toolApprovalEventExample} />
 
+Approval requests belong to the `RealtimeAgent` instance that issued them.
+After a handoff or `updateAgent()` call changes the active agent, `approve()` and
+`reject()` reject requests from a different agent without recording a decision or
+executing a tool. Restore the originating agent instance to resolve its pending
+request, or resolve a new approval request issued by the current agent.
+
 <Aside type="note">
   While the voice agent is waiting for approval for the tool call, the agent
   won't be able to process new requests from the user.
