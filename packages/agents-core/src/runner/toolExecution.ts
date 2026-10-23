@@ -1029,6 +1029,26 @@ export async function executeComputerActions(
       });
       return cachedRejectionMessage;
     };
+    const buildRejectionItem = (rejectionMessage: string) => {
+      const rejectionOutput: protocol.ComputerToolOutput = {
+        type: 'computer_screenshot',
+        data: TOOL_APPROVAL_REJECTION_SCREENSHOT_DATA_URL,
+        providerData: {
+          approvalStatus: 'rejected',
+          message: rejectionMessage,
+        },
+      };
+      const rawItem: protocol.ComputerCallResultItem = {
+        type: 'computer_call_result',
+        callId: toolCall.callId,
+        output: rejectionOutput,
+      };
+      return new RunToolCallOutputItem(
+        rawItem,
+        agent,
+        TOOL_APPROVAL_REJECTION_SCREENSHOT_DATA_URL,
+      );
+    };
     const pendingSafetyChecks = getPendingSafetyChecks(toolCall);
     const approvalItem = new RunToolApprovalItem(
       toolCall,
@@ -1055,27 +1075,8 @@ export async function executeComputerActions(
       callId: toolCall.callId,
       approvalItem,
       needsApproval,
-      buildRejectionItem: async () => {
-        const rejectionMessage = await getRejectionMessage();
-        const rejectionOutput: protocol.ComputerToolOutput = {
-          type: 'computer_screenshot',
-          data: TOOL_APPROVAL_REJECTION_SCREENSHOT_DATA_URL,
-          providerData: {
-            approvalStatus: 'rejected',
-            message: rejectionMessage,
-          },
-        };
-        const rawItem: protocol.ComputerCallResultItem = {
-          type: 'computer_call_result',
-          callId: toolCall.callId,
-          output: rejectionOutput,
-        };
-        return new RunToolCallOutputItem(
-          rawItem,
-          agent,
-          TOOL_APPROVAL_REJECTION_SCREENSHOT_DATA_URL,
-        );
-      },
+      buildRejectionItem: async () =>
+        buildRejectionItem(await getRejectionMessage()),
     });
 
     if (approvalDecision.status === 'rejected') {
@@ -1112,6 +1113,26 @@ export async function executeComputerActions(
                 onSafetyCheck: computerTool.onSafetyCheck,
               })
             : undefined;
+
+        if (acknowledgedSafetyChecks === false) {
+          const rejectionMessage = await getRejectionMessage();
+          const rejectionItem = buildRejectionItem(rejectionMessage);
+          emitToolEnd(
+            runner,
+            runContext,
+            agent,
+            computerTool,
+            rejectionMessage,
+            toolCall,
+          );
+          if (span && runner.config.traceIncludeSensitiveData) {
+            span.spanData.output = rejectionMessage;
+          }
+          return [
+            rejectionItem,
+            new RunMessageOutputItem(assistant(rejectionMessage), agent),
+          ];
+        }
 
         // Run the action and get screenshot.
         let output: string;
@@ -1164,7 +1185,9 @@ export async function executeComputerActions(
       },
     );
 
-    results.push(computerItem);
+    results.push(
+      ...(Array.isArray(computerItem) ? computerItem : [computerItem]),
+    );
   }
   return results;
 }
@@ -1843,7 +1866,7 @@ async function resolveSafetyCheckAcknowledgements(options: {
     pendingSafetyChecks: ComputerSafetyCheck[];
     toolCall: protocol.ComputerUseCallItem;
   }) => Promise<ComputerSafetyCheckResult>;
-}): Promise<ComputerSafetyCheck[] | undefined> {
+}): Promise<ComputerSafetyCheck[] | false | undefined> {
   const { runContext, toolCall, pendingSafetyChecks, onSafetyCheck } = options;
   if (!onSafetyCheck) {
     return undefined;
@@ -1857,7 +1880,7 @@ async function resolveSafetyCheckAcknowledgements(options: {
     return pendingSafetyChecks;
   }
   if (result === false) {
-    return undefined;
+    return false;
   }
   return normalizeSafetyCheckResult(result);
 }
