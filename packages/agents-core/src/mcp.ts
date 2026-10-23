@@ -327,8 +327,25 @@ export class MCPServerSSE extends BaseMCPServerSSE {
  * Logs and skips any servers that fail to respond.
  */
 
-const _cachedTools: Record<string, MCPTool[]> = {};
+const _cachedTools: Record<
+  string,
+  { serverInstanceId: number; tools: MCPTool[] }
+> = {};
 const _cachedToolKeysByServer: Record<string, Set<string>> = {};
+const _mcpServerInstanceIds = new WeakMap<MCPServer, number>();
+let _nextMcpServerInstanceId = 0;
+
+function getMCPServerInstanceId(server: MCPServer): number {
+  const existingId = _mcpServerInstanceIds.get(server);
+  if (existingId !== undefined) {
+    return existingId;
+  }
+
+  const instanceId = ++_nextMcpServerInstanceId;
+  _mcpServerInstanceIds.set(server, instanceId);
+  return instanceId;
+}
+
 /**
  * Remove cached tools for the given server so the next lookup fetches fresh data.
  *
@@ -355,6 +372,8 @@ export async function invalidateServerToolsCache(serverName: string) {
 /**
  * Function signature for generating the MCP tool cache key.
  * Customizable so the cache key can depend on any context—server, agent, runContext, etc.
+ * Callable tool filters are not cached by default because their result may depend on
+ * RunContext values that the default key cannot represent.
  */
 export type MCPToolCacheKeyGenerator = (params: {
   server: MCPServer;
@@ -397,9 +416,20 @@ async function getFunctionToolsFromServer<TContext = UnknownContext>({
     agent,
     runContext,
   });
+  const serverInstanceId = getMCPServerInstanceId(server);
+  const shouldCacheToolsList =
+    server.cacheToolsList &&
+    // Filtered and context-free discovery must never share a cache entry.
+    (!server.toolFilter || Boolean(runContext && agent)) &&
+    (typeof server.toolFilter !== 'function' ||
+      generateMCPToolCacheKey !== undefined);
   // Use cache key generator injected from the outside, or the default if absent.
-  if (server.cacheToolsList && _cachedTools[cacheKey]) {
-    return _cachedTools[cacheKey].map((t) =>
+  const cachedTools = _cachedTools[cacheKey];
+  if (
+    shouldCacheToolsList &&
+    cachedTools?.serverInstanceId === serverInstanceId
+  ) {
+    return cachedTools.tools.map((t) =>
       mcpToFunctionTool(t, server, convertSchemasToStrict),
     );
   }
@@ -463,8 +493,8 @@ async function getFunctionToolsFromServer<TContext = UnknownContext>({
       mcpToFunctionTool(t, server, convertSchemasToStrict),
     );
     // Cache store
-    if (server.cacheToolsList) {
-      _cachedTools[cacheKey] = mcpTools;
+    if (shouldCacheToolsList) {
+      _cachedTools[cacheKey] = { serverInstanceId, tools: mcpTools };
       if (!_cachedToolKeysByServer[server.name]) {
         _cachedToolKeysByServer[server.name] = new Set();
       }

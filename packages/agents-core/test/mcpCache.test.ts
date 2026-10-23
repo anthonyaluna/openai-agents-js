@@ -80,22 +80,29 @@ describe('MCP tools cache invalidation', () => {
 
   it('binds cached tools to the current server instance', async () => {
     await withTrace('test', async () => {
-      const tools = [
+      const toolsA = [
         {
           name: 'a',
           description: '',
           inputSchema: { type: 'object', properties: {} },
         },
       ];
+      const toolsB = [
+        {
+          name: 'b',
+          description: '',
+          inputSchema: { type: 'object', properties: {} },
+        },
+      ];
 
-      const serverA = new StubServer('server', tools);
+      const serverA = new StubServer('same-name-server-instance-test', toolsA);
       await getAllMcpTools({
         mcpServers: [serverA],
         runContext: new RunContext({}),
         agent: new Agent({ name: 'test' }),
       });
 
-      const serverB = new StubServer('server', tools);
+      const serverB = new StubServer('same-name-server-instance-test', toolsB);
       let called = false;
       (serverB as any).callTool = async () => {
         called = true;
@@ -107,9 +114,49 @@ describe('MCP tools cache invalidation', () => {
         runContext: new RunContext({}),
         agent: new Agent({ name: 'test' }),
       })) as FunctionTool[];
+      expect(cachedTools.map((tool) => tool.name)).toEqual(['b']);
       await cachedTools[0].invoke({} as any, '{}');
 
       expect(called).toBe(true);
+    });
+  });
+
+  it('does not reuse a callable filter result across run contexts by default', async () => {
+    await withTrace('test', async () => {
+      const tools = [
+        {
+          name: 'foo',
+          description: '',
+          inputSchema: { type: 'object', properties: {} },
+        },
+        {
+          name: 'bar',
+          description: '',
+          inputSchema: { type: 'object', properties: {} },
+        },
+      ];
+      const server = new StubServer('context-filtered-server', tools);
+      server.toolFilter = async (ctx: any, tool: any) =>
+        tool.name === (ctx.runContext.meta as any).kind;
+      const agent = new Agent({ name: 'same-agent' });
+      const fooContext = new RunContext({});
+      (fooContext as any).meta = { kind: 'foo' };
+      const barContext = new RunContext({});
+      (barContext as any).meta = { kind: 'bar' };
+
+      const fooTools = await getAllMcpTools({
+        mcpServers: [server],
+        runContext: fooContext,
+        agent,
+      });
+      const barTools = await getAllMcpTools({
+        mcpServers: [server],
+        runContext: barContext,
+        agent,
+      });
+
+      expect(fooTools.map((tool) => tool.name)).toEqual(['foo']);
+      expect(barTools.map((tool) => tool.name)).toEqual(['bar']);
     });
   });
 
@@ -253,6 +300,66 @@ describe('MCP tools cache invalidation', () => {
 });
 
 describe('MCP tools static filters', () => {
+  it.each(['legacy', 'missing run context', 'missing agent'])(
+    'does not reuse an unfiltered %s lookup for an agent lookup',
+    async (lookup) => {
+      const tools = ['safe', 'danger'].map((name) => ({
+        name,
+        description: '',
+        inputSchema: { type: 'object', properties: {} },
+      }));
+      const server = new StubServer(`static-prefetch-${lookup}`, tools);
+      server.toolFilter = { allowedToolNames: ['safe'] };
+      const agent = new Agent({ name: 'test' });
+      const runContext = new RunContext({});
+
+      const prefetch =
+        lookup === 'legacy'
+          ? await getAllMcpTools([server])
+          : await getAllMcpTools({
+              mcpServers: [server],
+              ...(lookup === 'missing run context'
+                ? { agent }
+                : { runContext }),
+            });
+      // Context-free discovery retains its existing unfiltered behavior.
+      expect(prefetch.map((tool) => tool.name)).toEqual(['safe', 'danger']);
+
+      const filtered = await getAllMcpTools({
+        mcpServers: [server],
+        runContext,
+        agent,
+      });
+      expect(filtered.map((tool) => tool.name)).toEqual(['safe']);
+    },
+  );
+
+  it('keeps context-free discovery independent of a previously filtered cache entry', async () => {
+    const tools = ['safe', 'danger'].map((name) => ({
+      name,
+      description: '',
+      inputSchema: { type: 'object', properties: {} },
+    }));
+    const server = new StubServer('static-filtered-before-prefetch', tools);
+    server.toolFilter = { blockedToolNames: ['danger'] };
+    const options = {
+      mcpServers: [server],
+      runContext: new RunContext({}),
+      agent: new Agent({ name: 'test' }),
+    };
+
+    expect((await getAllMcpTools(options)).map((tool) => tool.name)).toEqual([
+      'safe',
+    ]);
+    expect((await getAllMcpTools([server])).map((tool) => tool.name)).toEqual([
+      'safe',
+      'danger',
+    ]);
+    expect((await getAllMcpTools(options)).map((tool) => tool.name)).toEqual([
+      'safe',
+    ]);
+  });
+
   it('filters tools using allowed and blocked tool names', async () => {
     await withTrace('test', async () => {
       const tools = [
