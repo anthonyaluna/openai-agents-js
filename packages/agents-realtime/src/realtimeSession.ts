@@ -564,6 +564,9 @@ export class RealtimeSession<
   async #handleFunctionToolCall(
     toolCall: TransportToolCallEvent,
     tool: FunctionTool<RealtimeContextData<TBaseContext>, any, unknown>,
+    originatingAgent:
+      | RealtimeAgent<TBaseContext>
+      | RealtimeAgent<RealtimeContextData<TBaseContext>>,
   ) {
     this.#context.context.history = JSON.parse(JSON.stringify(this.#history)); // deep copy of the history
     let parsedArgs: any = toolCall.arguments;
@@ -610,16 +613,11 @@ export class RealtimeSession<
         });
         return;
       } else if (typeof approval === 'undefined') {
-        this.emit(
-          'tool_approval_requested',
-          this.#context,
-          this.#currentAgent,
-          {
-            type: 'function_approval' as const,
-            tool,
-            approvalItem: new RunToolApprovalItem(toolCall, this.#currentAgent),
-          },
-        );
+        this.emit('tool_approval_requested', this.#context, originatingAgent, {
+          type: 'function_approval' as const,
+          tool,
+          approvalItem: new RunToolApprovalItem(toolCall, originatingAgent),
+        });
         return;
       }
     }
@@ -687,15 +685,16 @@ export class RealtimeSession<
   }
 
   async #handleFunctionCall(toolCall: TransportToolCallEvent) {
+    const originatingAgent = this.#currentAgent;
     const enabledHandoffs = await (
-      this.#currentAgent as RealtimeAgent<TBaseContext>
+      originatingAgent as RealtimeAgent<TBaseContext>
     ).getEnabledHandoffs(this.#context);
     const handoffMap = new Map(
       enabledHandoffs.map((handoff) => [handoff.toolName, handoff]),
     );
 
     const allTools = await (
-      this.#currentAgent as RealtimeAgent<TBaseContext>
+      originatingAgent as RealtimeAgent<TBaseContext>
     ).getAllTools(this.#context);
     const functionToolMap = new Map(allTools.map((tool) => [tool.name, tool]));
 
@@ -705,7 +704,11 @@ export class RealtimeSession<
     } else {
       const functionTool = functionToolMap.get(toolCall.name);
       if (functionTool && functionTool.type === 'function') {
-        await this.#handleFunctionToolCall(toolCall, functionTool);
+        await this.#handleFunctionToolCall(
+          toolCall,
+          functionTool,
+          originatingAgent,
+        );
       } else {
         throw new ModelBehaviorError(`Tool ${toolCall.name} not found`);
       }
@@ -1117,6 +1120,14 @@ export class RealtimeSession<
     this.#transport.interrupt();
   }
 
+  #assertApprovalAgent(approvalItem: RunToolApprovalItem) {
+    if (approvalItem.agent !== this.#currentAgent) {
+      throw new ModelBehaviorError(
+        'Cannot resolve a tool approval from a different agent. Restore the originating agent before resolving this approval.',
+      );
+    }
+  }
+
   /**
    * Approve a tool call. This will also trigger the tool call to the agent.
    * @param approvalItem - The approval item to approve.
@@ -1127,6 +1138,7 @@ export class RealtimeSession<
     approvalItem: RunToolApprovalItem,
     options: { alwaysApprove?: boolean } = { alwaysApprove: false },
   ) {
+    this.#assertApprovalAgent(approvalItem);
     this.#context.approveTool(approvalItem, options);
     const toolName =
       approvalItem.toolName ?? (approvalItem.rawItem as any).name;
@@ -1138,7 +1150,11 @@ export class RealtimeSession<
       tool.type === 'function' &&
       approvalItem.rawItem.type === 'function_call'
     ) {
-      await this.#handleFunctionToolCall(approvalItem.rawItem, tool);
+      await this.#handleFunctionToolCall(
+        approvalItem.rawItem,
+        tool,
+        this.#currentAgent,
+      );
     } else if (approvalItem.rawItem.type === 'hosted_tool_call') {
       if (options.alwaysApprove) {
         logger.warn(
@@ -1163,6 +1179,7 @@ export class RealtimeSession<
     approvalItem: RunToolApprovalItem,
     options: { alwaysReject?: boolean } = { alwaysReject: false },
   ) {
+    this.#assertApprovalAgent(approvalItem);
     this.#context.rejectTool(approvalItem, options);
 
     // we still need to simulate a tool call to the agent to let the agent know
@@ -1176,7 +1193,11 @@ export class RealtimeSession<
       tool.type === 'function' &&
       approvalItem.rawItem.type === 'function_call'
     ) {
-      await this.#handleFunctionToolCall(approvalItem.rawItem, tool);
+      await this.#handleFunctionToolCall(
+        approvalItem.rawItem,
+        tool,
+        this.#currentAgent,
+      );
     } else if (approvalItem.rawItem.type === 'hosted_tool_call') {
       if (options.alwaysReject) {
         logger.warn(

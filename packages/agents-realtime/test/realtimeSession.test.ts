@@ -808,6 +808,203 @@ describe('RealtimeSession', () => {
     );
   });
 
+  it.each([
+    ['approve', false],
+    ['approve', true],
+    ['reject', false],
+    ['reject', true],
+  ] as const)(
+    'rejects stale %s decisions before state changes (always: %s)',
+    async (decision, always) => {
+      const executeA = vi.fn(async () => 'A');
+      const executeB = vi.fn(async () => 'B');
+      const makeTool = (execute: () => Promise<string>) =>
+        tool({
+          name: 'same_name_action',
+          description: 'Synthetic approval test.',
+          parameters: z.object({}),
+          needsApproval: true,
+          execute,
+        });
+      // Identical names must not make different agent instances interchangeable.
+      const agentA = new RealtimeAgent({
+        name: 'SameName',
+        tools: [makeTool(executeA)],
+      });
+      const agentB = new RealtimeAgent({
+        name: 'SameName',
+        tools: [makeTool(executeB)],
+      });
+      const transport = new FakeTransport();
+      const session = new RealtimeSession(agentA, { transport });
+      await session.connect({ apiKey: 'test' });
+      const requested = waitForEvent<any[]>(session, 'tool_approval_requested');
+      transport.emit('function_call', {
+        type: 'function_call',
+        name: 'same_name_action',
+        callId: 'stale-call',
+        arguments: '{}',
+      } as any);
+      const [, , { approvalItem }] = await requested;
+      await session.updateAgent(agentB);
+
+      const result =
+        decision === 'approve'
+          ? session.approve(approvalItem, { alwaysApprove: always })
+          : session.reject(approvalItem, { alwaysReject: always });
+      await expect(result).rejects.toBeInstanceOf(ModelBehaviorError);
+      expect(executeA).not.toHaveBeenCalled();
+      expect(executeB).not.toHaveBeenCalled();
+      expect(transport.sendFunctionCallOutputCalls).toHaveLength(0);
+      expect(
+        session.context.isToolApproved({
+          toolName: 'same_name_action',
+          callId: 'stale-call',
+        }),
+      ).toBeUndefined();
+      expect(
+        session.context.isToolApproved({
+          toolName: 'same_name_action',
+          callId: 'fresh-call',
+        }),
+      ).toBeUndefined();
+
+      const freshApproval = new RunToolApprovalItem(
+        {
+          type: 'function_call',
+          name: 'same_name_action',
+          callId: 'fresh-call',
+          arguments: '{}',
+        },
+        agentB,
+      );
+      await session.approve(freshApproval);
+      expect(executeB).toHaveBeenCalledOnce();
+      expect(executeA).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['approve', 'needsApproval'],
+    ['reject', 'needsApproval'],
+    ['approve', 'toolDiscovery'],
+    ['reject', 'toolDiscovery'],
+  ] as const)(
+    'preserves approval origin across async %s decision during %s',
+    async (decision, boundary) => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let entered!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const executeA = vi.fn(async () => 'A');
+      const executeB = vi.fn(async () => 'B');
+      const toolA = tool({
+        name: 'async_action',
+        description: 'Synthetic asynchronous approval test.',
+        parameters: z.object({}),
+        needsApproval: async () => {
+          if (boundary === 'needsApproval') {
+            entered();
+            await gate;
+          }
+          return true;
+        },
+        execute: executeA,
+      });
+      const toolB = tool({
+        name: 'async_action',
+        description: 'Synthetic asynchronous approval test.',
+        parameters: z.object({}),
+        needsApproval: true,
+        execute: executeB,
+      });
+      const agentA = new RealtimeAgent({ name: 'A', tools: [toolA] });
+      const agentB = new RealtimeAgent({ name: 'B', tools: [toolB] });
+      const transport = new FakeTransport();
+      const session = new RealtimeSession(agentA, { transport });
+      await session.connect({ apiKey: 'test' });
+      if (boundary === 'toolDiscovery') {
+        vi.spyOn(agentA, 'getAllTools').mockImplementationOnce(async () => {
+          entered();
+          await gate;
+          return [toolA];
+        });
+      }
+      const requested = waitForEvent<any[]>(session, 'tool_approval_requested');
+      transport.emit('function_call', {
+        type: 'function_call',
+        name: 'async_action',
+        callId: 'async-call',
+        arguments: '{}',
+      } as any);
+      await waiting;
+      await session.updateAgent(agentB);
+      release();
+      const [, eventAgent, { approvalItem }] = await requested;
+
+      expect(eventAgent).toBe(agentA);
+      expect(approvalItem.agent).toBe(agentA);
+      await expect(session[decision](approvalItem)).rejects.toBeInstanceOf(
+        ModelBehaviorError,
+      );
+      expect(executeA).not.toHaveBeenCalled();
+      expect(executeB).not.toHaveBeenCalled();
+      expect(transport.sendFunctionCallOutputCalls).toHaveLength(0);
+      expect(
+        session.context.isToolApproved({
+          toolName: 'async_action',
+          callId: 'async-call',
+        }),
+      ).toBeUndefined();
+
+      await session.updateAgent(agentA);
+      await session[decision](approvalItem);
+      expect(executeA).toHaveBeenCalledTimes(decision === 'approve' ? 1 : 0);
+      expect(executeB).not.toHaveBeenCalled();
+      expect(transport.sendFunctionCallOutputCalls).toHaveLength(1);
+    },
+  );
+
+  it.each(['approve', 'reject'] as const)(
+    'rejects stale hosted MCP %s decisions before sending a response',
+    async (decision) => {
+      const agentA = new RealtimeAgent({ name: 'A' });
+      const agentB = new RealtimeAgent({ name: 'B' });
+      const transport = new FakeTransport();
+      const session = new RealtimeSession(agentA, { transport });
+      await session.connect({ apiKey: 'test' });
+      const approvalItem = new RunToolApprovalItem(
+        {
+          type: 'hosted_tool_call',
+          id: 'stale-hosted-call',
+          name: 'hosted_action',
+          arguments: '{}',
+          providerData: {
+            itemId: 'stale-hosted-call',
+            serverLabel: 'synthetic-server',
+          },
+        },
+        agentA,
+      );
+      await session.updateAgent(agentB);
+
+      await expect(session[decision](approvalItem)).rejects.toBeInstanceOf(
+        ModelBehaviorError,
+      );
+      expect(transport.sendMcpResponseCalls).toHaveLength(0);
+      expect(
+        session.context.isToolApproved({
+          toolName: 'hosted_action',
+          callId: 'stale-hosted-call',
+        }),
+      ).toBeUndefined();
+    },
+  );
+
   it('requests tool approval when no decision exists', async () => {
     const needsApprovalTool = tool({
       name: 'needs_approval',
