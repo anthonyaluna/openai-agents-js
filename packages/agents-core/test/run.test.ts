@@ -187,6 +187,118 @@ describe('Runner.run', () => {
       expectTypeOf(result.finalOutput).toEqualTypeOf<string | undefined>();
     });
 
+    it.each([
+      { stream: false, needsApproval: false },
+      { stream: true, needsApproval: false },
+      { stream: false, needsApproval: true },
+    ])(
+      'continues after an onSafetyCheck rejection (stream=$stream, approval=$needsApproval)',
+      async ({ stream, needsApproval }) => {
+        class SequentialModel implements Model {
+          readonly requests: ModelRequest[] = [];
+
+          constructor(private readonly responses: ModelResponse[]) {}
+
+          async getResponse(request: ModelRequest): Promise<ModelResponse> {
+            this.requests.push(request);
+            const response = this.responses.shift();
+            if (!response) {
+              throw new Error('No response found');
+            }
+            return response;
+          }
+
+          async *getStreamedResponse(
+            request: ModelRequest,
+          ): AsyncIterable<protocol.StreamEvent> {
+            const response = await this.getResponse(request);
+            yield {
+              type: 'response_done',
+              response: {
+                id: 'safety-check-response',
+                usage: {
+                  requests: 1,
+                  inputTokens: 0,
+                  outputTokens: 0,
+                  totalTokens: 0,
+                },
+                output: response.output,
+              },
+            } as protocol.StreamEvent;
+          }
+        }
+
+        const computer = new FakeComputer();
+        const click = vi.spyOn(computer, 'click');
+        const screenshot = vi.spyOn(computer, 'screenshot');
+        const onSafetyCheck = vi.fn(async () => false);
+        const model = new SequentialModel([
+          {
+            output: [
+              {
+                type: 'computer_call',
+                id: 'computer-item',
+                callId: 'declined-call',
+                status: 'completed',
+                action: { type: 'click', x: 1, y: 1, button: 'left' },
+                providerData: {
+                  pending_safety_checks: [
+                    { id: 'check-1', code: 'sensitive_domain' },
+                  ],
+                },
+              } as protocol.ComputerUseCallItem,
+            ],
+            usage: new Usage(),
+          },
+          { output: [fakeModelMessage('done')], usage: new Usage() },
+        ]);
+        const agent = new Agent({
+          name: 'SafetyCheckAgent',
+          model,
+          tools: [computerTool({ computer, onSafetyCheck, needsApproval })],
+        });
+        const runner = new Runner({ tracingDisabled: true });
+
+        const interrupted = needsApproval
+          ? await runner.run(agent, 'start')
+          : undefined;
+        if (interrupted) {
+          expect(interrupted.interruptions).toHaveLength(1);
+          expect(onSafetyCheck).not.toHaveBeenCalled();
+          interrupted.state.approve(interrupted.interruptions[0]);
+        }
+
+        const input = interrupted?.state ?? 'start';
+        const result = stream
+          ? await runner.run(agent, input, { stream: true })
+          : await runner.run(agent, input);
+        if ('completed' in result) {
+          await result.completed;
+        }
+
+        expect(result.finalOutput).toBe('done');
+        expect(onSafetyCheck).toHaveBeenCalledTimes(1);
+        expect(click).not.toHaveBeenCalled();
+        expect(screenshot).not.toHaveBeenCalled();
+        expect(model.requests).toHaveLength(2);
+        expect(getRequestInputItems(model.requests[1]!)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: 'computer_call_result',
+              callId: 'declined-call',
+              output: expect.objectContaining({
+                type: 'computer_screenshot',
+                providerData: expect.objectContaining({
+                  approvalStatus: 'rejected',
+                }),
+              }),
+            }),
+            expect.objectContaining({ type: 'message', role: 'assistant' }),
+          ]),
+        );
+      },
+    );
+
     it('exposes aggregated usage on run results', async () => {
       const model = new FakeModel([
         {

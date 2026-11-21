@@ -182,6 +182,10 @@ export type ComputerSafetyCheck = {
   [key: string]: unknown;
 };
 
+/**
+ * Return false to reject the computer call before its actions execute. Returning
+ * void leaves checks unacknowledged but allows execution.
+ */
 export type ComputerSafetyCheckResult =
   | void
   | boolean
